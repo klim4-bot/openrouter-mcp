@@ -2,217 +2,243 @@ import os
 import httpx
 import json
 import urllib.parse
+import logging
+import time
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
-# Load .env if present (optional, for local dev convenience)
+# --- Pre-computation & Setup ---
+# 1. Load environment variables
 load_dotenv()
 
-# Initialize FastMCP server
+# 2. Setup Logging
+# Use LOG_LEVEL from env, default to INFO.
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("OpenRouterMCP")
+
+# 3. Initialize MCP Server
 mcp = FastMCP("OpenRouter MCP")
 
-# --- Configuration Management ---
-# Priority: Env Vars > Default Defaults
-
-# 1. API Key (Required)
+# --- Configuration & Globals ---
 API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# 2. Default Model (Optional)
 DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "google/gemini-2.0-flash-lite-001")
-
-# 3. Model Aliases (Optional JSON string)
-# Users can provide this via env var in MCP settings
 ALIASES_JSON = os.getenv("OPENROUTER_MODEL_ALIASES", "{}")
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 120.0))
 
 try:
     MODEL_ALIASES = json.loads(ALIASES_JSON)
 except json.JSONDecodeError:
-    print("Warning: Failed to parse OPENROUTER_MODEL_ALIASES JSON.")
+    logger.warning("Failed to parse OPENROUTER_MODEL_ALIASES JSON. No aliases will be used.")
     MODEL_ALIASES = {}
+
+# Validate and sanitize aliases
+INVALID_MODELS = set()
+MODEL_ALIASES = {k.lower(): v for k, v in MODEL_ALIASES.items() if v not in INVALID_MODELS}
+logger.info(f"Loaded {len(MODEL_ALIASES)} model aliases.")
+
+# 4. Global HTTP Client for performance (connection pooling)
+http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+
+# 5. In-memory cache for model list
+model_cache = {"models": [], "expiry": 0}
+MODEL_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 BASE_URL = "https://openrouter.ai/api/v1"
 
+# --- Helper Functions ---
+
 def resolve_model(model_name: str) -> str:
-    """Resolve model alias or use default if empty."""
+    """Safely resolve a model alias to a model ID, falling back to default."""
     if not model_name:
         return DEFAULT_MODEL
-    return MODEL_ALIASES.get(model_name.lower(), model_name)
+    
+    alias_lower = model_name.lower()
+    resolved_model = MODEL_ALIASES.get(alias_lower)
+    
+    if resolved_model:
+        return resolved_model
+    else:
+        logger.warning(f"Unknown model alias '{model_name}' requested. Falling back to default.")
+        return DEFAULT_MODEL
+
+def validate_image_url(url: str) -> bool:
+    """Basic validation for image URL scheme."""
+    if not url: return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        # Allow only public, web-accessible schemes
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        # Disallow localhost or internal-looking IPs for security
+        if parsed.hostname in ('localhost', '127.0.0.1') or (parsed.hostname and parsed.hostname.startswith('192.168.')):
+            return False
+        return True
+    except ValueError:
+        return False
+
+def validate_dimensions(width: int, height: int) -> tuple[int, int]:
+    """Validate and clamp image dimensions to a safe range."""
+    MAX_DIM, MIN_DIM = 2048, 128
+    return max(MIN_DIM, min(MAX_DIM, width)), max(MIN_DIM, min(MAX_DIM, height))
+
+def sanitize_markdown(text: str) -> str:
+    """Simple sanitization for alt-text in markdown."""
+    return text.replace("[", "\\[").replace("]", "\\]")
+
+# --- Core API Logic ---
 
 @mcp.tool()
 async def list_models(limit: int = 10, search: str = None) -> str:
-    """
-    List available models on OpenRouter.
-    Optionally filter by search term and limit results.
-    """
+    """List available models on OpenRouter, with caching."""
     if not API_KEY:
-        return "Error: OPENROUTER_API_KEY not found in environment variables."
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(f"{BASE_URL}/models")
-            response.raise_for_status()
-            models = response.json()["data"]
-            
-            # Simple search filter
-            if search:
-                models = [m for m in models if search.lower() in m["id"].lower()]
-            
-            # Sort by pricing (cheapest first) just as a heuristic
-            models.sort(key=lambda x: float(x["pricing"]["prompt"]) if "pricing" in x else 0)
-            
-            # Format output
-            result = [f"Found {len(models)} models (showing top {limit}):"]
-            if MODEL_ALIASES:
-                result.append(f"Aliases available: {', '.join(MODEL_ALIASES.keys())}")
-                
-            for m in models[:limit]:
-                price = m.get("pricing", {}).get("prompt", "N/A")
-                context = m.get("context_length", "N/A")
-                result.append(f"- {m['id']} (Context: {context}, Price: {price})")
-                
-            return "\n".join(result)
-            
-        except Exception as e:
-            return f"Error fetching models: {str(e)}"
-
-# Prioritized list of aliases to try for auto-selection (best performance first)
-AUTO_MODEL_PRIORITY = ["llama-free", "deepseek-free", "gemma-free", "stepfun-free"]
-
-async def try_chat_request(client, model, messages, headers):
-    """Helper to execute a single chat request with error handling."""
-    full_response = []
+        return "Error: OPENROUTER_API_KEY is not set."
     
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True
+    # Clamp limit to a safe range
+    safe_limit = max(1, min(100, limit))
+
+    try:
+        # Check cache first
+        if time.time() < model_cache["expiry"]:
+            logger.info("Returning cached model list.")
+            models = model_cache["models"]
+        else:
+            logger.info("Fetching fresh model list from OpenRouter.")
+            response = await http_client.get(f"{BASE_URL}/models")
+            response.raise_for_status()
+            data = response.json()
+            if "data" not in data:
+                return "Error: Invalid response from OpenRouter API."
+            models = data["data"]
+            # Update cache
+            model_cache["models"] = models
+            model_cache["expiry"] = time.time() + MODEL_CACHE_TTL_SECONDS
+        
+        if search:
+            models = [m for m in models if search.lower() in m["id"].lower()]
+        
+        models.sort(key=lambda x: float(x.get("pricing", {}).get("prompt", 'inf')))
+        
+        result = [f"Found {len(models)} models (showing top {safe_limit}):"]
+        if MODEL_ALIASES:
+            result.append(f"Aliases: {', '.join(MODEL_ALIASES.keys())}")
+        
+        for m in models[:safe_limit]:
+            price = m.get("pricing", {}).get("prompt", "N/A")
+            context = m.get("context_length", "N/A")
+            result.append(f"- {m['id']} (Context: {context}, Price: {price})")
+            
+        return "\n".join(result)
+        
+    except httpx.HTTPStatusError as e:
+        logger.error(f"API Error fetching models: {e.response.status_code}")
+        return f"API Error {e.response.status_code} while fetching models."
+    except Exception as e:
+        logger.error(f"Unexpected error fetching models: {e}", exc_info=True)
+        return "An unexpected error occurred while fetching models."
+
+async def try_chat_request(model: str, messages: list) -> tuple[str | None, str | None]:
+    """Helper to execute a single chat request with the global client."""
+    full_response = []
+    payload = {"model": model, "messages": messages, "stream": True}
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "HTTP-Referer": "https://github.com/klim4-bot/openrouter-mcp",
+        "X-Title": "OpenClaw-MCP"
     }
     
     try:
-        async with client.stream(
-            "POST", 
-            f"{BASE_URL}/chat/completions", 
-            json=payload, 
-            headers=headers, 
-            timeout=120.0
-        ) as response:
+        async with http_client.stream("POST", f"{BASE_URL}/chat/completions", json=payload, headers=headers) as response:
             if response.status_code != 200:
-                await response.aread()
-                return None, f"API Error {response.status_code}: {response.text}"
+                # Read the body to avoid connection leaks
+                error_body = await response.aread()
+                logger.warning(f"API request to {model} failed with status {response.status_code}: {error_body.decode()}")
+                return None, f"API Error {response.status_code}."
             
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     line = line[6:]
-                    if line == "[DONE]":
-                        break
+                    if line == "[DONE]": break
                     try:
                         chunk = json.loads(line)
-                        if "choices" in chunk and len(chunk["choices"]) > 0:
-                            delta = chunk["choices"][0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_response.append(content)
-                    except json.JSONDecodeError:
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        # Handle both content and reasoning fields for compatibility
+                        content = delta.get("content") or delta.get("reasoning")
+                        if content:
+                            full_response.append(content)
+                    except (json.JSONDecodeError, IndexError):
+                        logger.warning(f"Could not parse stream chunk: {line}")
                         continue
                         
         return "".join(full_response), None
 
+    except httpx.TimeoutException:
+        logger.warning(f"Request to {model} timed out.")
+        return None, "Request timed out."
     except Exception as e:
-        return None, str(e)
+        logger.error(f"Unexpected error during chat request to {model}: {e}", exc_info=True)
+        return None, "An unexpected error occurred."
+
+def get_candidates_for_auto_mode(image_present: bool) -> list:
+    """Builds a prioritized list of model candidates for auto-mode."""
+    AUTO_MODEL_PRIORITY = ["llama-free", "deepseek-free", "gemma-free", "stepfun-free"]
+    candidate_aliases = list(AUTO_MODEL_PRIORITY)
+    
+    if image_present and "gemini" not in candidate_aliases:
+        candidate_aliases.insert(0, "gemini")
+    
+    candidates = [(alias, MODEL_ALIASES[alias]) for alias in candidate_aliases if alias in MODEL_ALIASES]
+    candidates.append(("default", DEFAULT_MODEL))
+    return candidates
 
 @mcp.tool()
-async def chat_completion(
-    model: str = None, 
-    prompt: str = "", 
-    image_url: str = None, 
-    system_prompt: str = None
-) -> str:
-    """
-    Send a chat completion request to an OpenRouter model.
-    - model: Target model alias or ID (auto-selects if omitted).
-    - prompt: User text prompt.
-    - image_url: Optional URL of an image to analyze.
-    - system_prompt: Optional system instruction.
-    """
-    if not API_KEY:
-        return "Error: OPENROUTER_API_KEY not found in environment variables."
+async def chat_completion(model: str = None, prompt: str = "", image_url: str = None, system_prompt: str = None) -> str:
+    """Send a chat completion request to an OpenRouter model."""
+    if not API_KEY: return "Error: OPENROUTER_API_KEY is not set."
+    if not prompt and not image_url: return "Error: Prompt cannot be empty without an image."
+    if image_url and not validate_image_url(image_url): return "Error: Invalid or disallowed image URL."
 
     messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+    if system_prompt: messages.append({"role": "system", "content": system_prompt})
 
-    # Construct user message (Text-only or Multimodal)
-    if image_url:
-        user_content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_url}}
-        ]
-    else:
-        user_content = prompt
+    user_content = [{"type": "text", "text": prompt}]
+    if image_url: user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+    messages.append({"role": "user", "content": user_content if image_url else prompt})
 
-    messages.append({"role": "user", "content": user_content})
+    if model:
+        target_model = resolve_model(model)
+        content, error = await try_chat_request(target_model, messages)
+        return content if content is not None else error
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "HTTP-Referer": "https://github.com/openclaw/openrouter-mcp",
-        "X-Title": "OpenClaw MCP"
-    }
-
-    async with httpx.AsyncClient() as client:
-        # 1. If model IS provided, try just that one
-        if model:
-            target_model = resolve_model(model)
-            content, error = await try_chat_request(client, target_model, messages, headers)
-            return content if content else error
-
-        # 2. If NO model provided, try auto-fallback chain
-        # Note: If image is present, we should prefer vision-capable models.
-        # For now, we use the same list, but Gemini (vision) is usually a safe bet.
-        print("🤖 Auto-mode: finding best available model...")
-        
-        # If image is present, prioritize Gemini as it's the best free vision model
-        # You might want to define a separate AUTO_VISION_PRIORITY list later.
-        candidate_aliases = list(AUTO_MODEL_PRIORITY)
-        if image_url and "gemini" not in candidate_aliases:
-             candidate_aliases.insert(0, "gemini") # Insert Gemini at top for vision
-        
-        # Build candidate list
-        candidates = []
-        for alias in candidate_aliases:
-            if alias in MODEL_ALIASES:
-                candidates.append((alias, MODEL_ALIASES[alias]))
-        
-        # Add default model
-        candidates.append(("default", DEFAULT_MODEL))
-
-        last_error = "No models available."
-        
-        for alias, model_id in candidates:
-            print(f"🔄 Trying {alias} ({model_id})...")
-            content, error = await try_chat_request(client, model_id, messages, headers)
+    logger.info("🤖 Auto-mode: finding best available model...")
+    candidates = get_candidates_for_auto_mode(image_url is not None)
+    last_error = "No models available or all failed."
+    
+    for alias, model_id in candidates:
+        logger.info(f"🔄 Trying {alias} ({model_id})...")
+        content, error = await try_chat_request(model_id, messages)
+        if content is not None:
+            return f"[Auto-selected: {alias}]\n{content}"
+        else:
+            logger.warning(f"⚠️ {alias} failed: {error}")
+            last_error = error
             
-            if content:
-                return f"[Auto-selected: {alias}]\n{content}"
-            else:
-                print(f"⚠️ {alias} failed: {error}")
-                last_error = error
-                
-        return f"All auto-models failed. Last error: {last_error}"
+    return f"All auto-models failed. Last error: {last_error}"
 
 @mcp.tool()
 async def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> str:
-    """
-    Generate an image based on a text prompt using Pollinations.ai (Free).
-    Returns a Markdown image URL.
-    """
-    # URL encode the prompt
-    encoded_prompt = urllib.parse.quote(prompt)
+    """Generate an image using Pollinations.ai."""
+    if not prompt: return "Error: Prompt cannot be empty."
     
-    # Construct the image URL
-    # Pollinations API format: https://image.pollinations.ai/prompt/{prompt}?width={width}&height={height}
+    width, height = validate_dimensions(width, height)
+    encoded_prompt = urllib.parse.quote(prompt)
     image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true"
     
-    return f"Here is your generated image:\n\n![{prompt}]({image_url})\n\n(URL: {image_url})"
+    # Use a generic, safe alt-text instead of the user's prompt
+    return f"![Generated Image]({image_url})\n\n(URL: {image_url})"
 
 if __name__ == "__main__":
-    mcp.run()
+    if not API_KEY:
+        logger.critical("FATAL: OPENROUTER_API_KEY is not set. The server will not start.")
+    else:
+        mcp.run()
