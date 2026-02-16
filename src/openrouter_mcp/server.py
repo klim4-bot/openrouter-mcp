@@ -26,16 +26,24 @@ DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "google/gemini-2.0-flash-l
 ALIASES_JSON = os.getenv("OPENROUTER_MODEL_ALIASES", "{}")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 120.0))
 
+# Parse and normalize model aliases from env
 try:
-    MODEL_ALIASES = json.loads(ALIASES_JSON)
-except json.JSONDecodeError:
-    logger.warning("Failed to parse OPENROUTER_MODEL_ALIASES JSON. No aliases will be used.")
+    raw_aliases = json.loads(ALIASES_JSON)
+    if not isinstance(raw_aliases, dict):
+        raise ValueError("OPENROUTER_MODEL_ALIASES must be a JSON object")
+except (json.JSONDecodeError, ValueError) as e:
+    logger.warning("Failed to parse OPENROUTER_MODEL_ALIASES (%s). No aliases will be used.", e)
+    MODEL_ALIASES: dict[str, str] = {}
+else:
     MODEL_ALIASES = {}
+    for k, v in raw_aliases.items():
+        # Only keep clean string->string mappings and normalize keys
+        if not isinstance(k, str) or not isinstance(v, str):
+            logger.warning("Ignoring non-string alias mapping: %r -> %r", k, v)
+            continue
+        MODEL_ALIASES[k.lower()] = v
 
-# Validate and sanitize aliases
-INVALID_MODELS = set()
-MODEL_ALIASES = {k.lower(): v for k, v in MODEL_ALIASES.items() if v not in INVALID_MODELS}
-logger.info(f"Loaded {len(MODEL_ALIASES)} model aliases.")
+logger.info("Loaded %d model aliases.", len(MODEL_ALIASES))
 
 # 4. Global HTTP Client for performance (connection pooling)
 http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
