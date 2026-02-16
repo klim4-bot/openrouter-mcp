@@ -23,6 +23,12 @@ It acts as a "Smart Manager" for your AI, enabling it to delegate tasks to cheap
   - Built-in `generate_image` tool powered by **Pollinations.ai**.
   - Create high-quality images for free without API keys.
 
+- **🧩 Model Hunter CLI (New)**
+  - `python -m openrouter_mcp.model_hunter` で `/models` API から
+    無料/低コストモデルを取得して一覧表示。
+  - `--free-only` で無料モデルだけ、`--max-prompt` で
+    最大プロンプト価格を指定可能。
+
 - **⚡️ Performance & Stability**
   - Reuses HTTP connections (`httpx.AsyncClient`) for lower latency.
   - Caches model lists for 5 minutes to reduce API calls.
@@ -40,8 +46,10 @@ This project has undergone a significant refactoring process guided by AI-driven
 - **Refactored**: Switched from `print` to a structured `logging` system.
 - **Refactored**: Implemented a global `httpx.AsyncClient` for connection pooling, improving performance.
 - **Feature**: Added a 5-minute in-memory cache for the `list_models` tool.
+- **Feature**: Added a `model_hunter` CLI to discover free/low-cost models from the OpenRouter `/models` API.
 - **Security**: Hardened the `validate_image_url` function to block localhost and internal IPs.
 - **Security**: Made the `generate_image` tool's markdown output safer by removing the user's prompt from the response template.
+- **Security**: Improved `OPENROUTER_MODEL_ALIASES` parsing/validation to ignore invalid JSON/非文字列のマッピング。
 - **Testing**: Replaced ad-hoc test scripts with a comprehensive test suite using **`pytest`**.
 - **Testing**: Implemented **`pytest-mock`** to create an isolated test environment, ensuring tests are reliable and independent of external factors (`.env` files).
 - **CI**: All 13 tests are now passing, ensuring code quality and stability.
@@ -91,6 +99,34 @@ OPENROUTER_MODEL_ALIASES='{"gemini": "google/gemini-pro-vision", "llama-free": "
 _(Configuration examples for Claude Desktop, Cursor, etc. remain the same)_
 
 ... (rest of the usage section can be kept as is) ...
+
+## 🔍 Using the Model Hunter CLI
+
+`model_hunter` は OpenRouter の `/models` API から
+無料/低コストモデルを一覧化するための小さな CLI です。
+
+仮想環境を有効化した上で、例えば次のように使えます:
+
+```bash
+# 無料モデルだけを確認
+python -m openrouter_mcp.model_hunter --free-only --limit 10
+
+# プロンプト価格が 0.5 以下のモデルを安い順に 20 件
+python -m openrouter_mcp.model_hunter --max-prompt 0.5 --limit 20
+```
+
+出力例:
+
+```text
+[OpenRouter Model Hunter]
+
+Free models (prompt price = 0):
+1. openrouter/aurora-alpha (context: 128000, prompt: 0)
+2. openrouter/free (context: 200000, prompt: 0)
+...
+
+Total listed: 10 (free: 10)
+```
 
 ## 🧪 Testing
 
