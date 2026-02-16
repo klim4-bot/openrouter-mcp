@@ -24,10 +24,8 @@ It acts as a "Smart Manager" for your AI, enabling it to delegate tasks to cheap
   - Create high-quality images for free without API keys.
 
 - **🧩 Model Hunter CLI (New)**
-  - `python -m openrouter_mcp.model_hunter` で `/models` API から
-    無料/低コストモデルを取得して一覧表示。
-  - `--free-only` で無料モデルだけ、`--max-prompt` で
-    最大プロンプト価格を指定可能。
+  - `python -m openrouter_mcp.model_hunter` to query the `/models` API and list free/low-cost models.
+  - Use `--free-only` to show only free models, or `--max-prompt` to cap the maximum prompt price.
 
 - **⚡️ Performance & Stability**
   - Reuses HTTP connections (`httpx.AsyncClient`) for lower latency.
@@ -49,7 +47,7 @@ This project has undergone a significant refactoring process guided by AI-driven
 - **Feature**: Added a `model_hunter` CLI to discover free/low-cost models from the OpenRouter `/models` API.
 - **Security**: Hardened the `validate_image_url` function to block localhost and internal IPs.
 - **Security**: Made the `generate_image` tool's markdown output safer by removing the user's prompt from the response template.
-- **Security**: Improved `OPENROUTER_MODEL_ALIASES` parsing/validation to ignore invalid JSON/非文字列のマッピング。
+- **Security**: Improved `OPENROUTER_MODEL_ALIASES` parsing/validation to ignore invalid JSON or non-string mappings.
 - **Testing**: Replaced ad-hoc test scripts with a comprehensive test suite using **`pytest`**.
 - **Testing**: Implemented **`pytest-mock`** to create an isolated test environment, ensuring tests are reliable and independent of external factors (`.env` files).
 - **CI**: All 13 tests are now passing, ensuring code quality and stability.
@@ -102,20 +100,20 @@ _(Configuration examples for Claude Desktop, Cursor, etc. remain the same)_
 
 ## 🔍 Using the Model Hunter CLI
 
-`model_hunter` は OpenRouter の `/models` API から
-無料/低コストモデルを一覧化するための小さな CLI です。
+`model_hunter` is a small CLI tool that queries the OpenRouter `/models` endpoint
+and lists free/low-cost models in a human-friendly format.
 
-仮想環境を有効化した上で、例えば次のように使えます:
+With your virtual environment activated, for example:
 
 ```bash
-# 無料モデルだけを確認
+# Show only free models
 python -m openrouter_mcp.model_hunter --free-only --limit 10
 
-# プロンプト価格が 0.5 以下のモデルを安い順に 20 件
+# Show up to 20 models with prompt price <= 0.5, sorted by price
 python -m openrouter_mcp.model_hunter --max-prompt 0.5 --limit 20
 ```
 
-出力例:
+Sample output:
 
 ```text
 [OpenRouter Model Hunter]
